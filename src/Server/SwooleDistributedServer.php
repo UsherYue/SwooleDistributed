@@ -1,16 +1,19 @@
 <?php
 namespace Server;
 
-use Server\Client\Client;
-use Server\CoreBase\CoroutineTask;
-use Server\CoreBase\GeneratorContext;
-use Server\CoreBase\InotifyProcess;
+use Server\Asyn\AsynPool;
+use Server\Asyn\HttpClient\HttpClientPool;
+use Server\Asyn\Mysql\Miner;
+use Server\Asyn\Mysql\MysqlAsynPool;
+use Server\Asyn\Redis\RedisAsynPool;
+use Server\Asyn\Redis\RedisLuaManager;
+use Server\Components\Consul\ConsulHelp;
+use Server\Components\Consul\ConsulServices;
+use Server\Components\Dispatch\DispatchHelp;
+use Server\Components\Reload\ReloadHelp;
 use Server\CoreBase\SwooleException;
-use Server\DataBase\AsynPoolManager;
-use Server\DataBase\Miner;
-use Server\DataBase\MysqlAsynPool;
-use Server\DataBase\RedisAsynPool;
-use Server\DataBase\RedisCoroutine;
+use Server\CoreBase\TimerTask;
+use Server\Coroutine\Coroutine;
 use Server\Test\TestModule;
 
 define("SERVER_DIR", __DIR__);
@@ -19,7 +22,7 @@ define("WWW_DIR", __DIR__ . "/../www");
 
 /**
  * Created by PhpStorm.
- * User: tmtbe
+ * User: zhangjincheng
  * Date: 16-7-14
  * Time: 上午9:18
  */
@@ -40,11 +43,6 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
      */
     public $mysql_pool;
     /**
-     * 各种client
-     * @var Client
-     */
-    public $client;
-    /**
      * 覆盖set配置
      * @var array
      */
@@ -54,7 +52,18 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
      * @var string
      */
     public $cache404;
-
+    /**
+     * 生成task_id的原子
+     */
+    public $task_atomic;
+    /**
+     * task_id和pid的映射
+     */
+    public $tid_pid_table;
+    /**
+     * 中断task的id内存锁
+     */
+    public $task_lock;
     /**
      * @var \Redis
      */
@@ -89,24 +98,20 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
      */
     private $USID;
     /**
-     * @var AsynPoolManager
-     */
-    private $asnyPoolManager;
-    /**
      * 多少人启用task进行发送
      * @var
      */
     private $send_use_task_num;
     /**
-     * 定时器
-     * @var array
-     */
-    private $timer_tasks_used;
-    /**
      * 初始化的锁
      * @var \swoole_lock
      */
     private $initLock;
+    /**
+     * 连接池
+     * @var
+     */
+    private $asynPools;
 
     /**
      * SwooleDistributedServer constructor.
@@ -129,7 +134,12 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
 
     public function start()
     {
-        $this->clearState();
+        //加载redis的lua脚本
+        $redis_pool = new RedisAsynPool($this->config, $this->config->get('redis.active'));
+        $redisLuaManager = new RedisLuaManager($redis_pool->getSync());
+        $redisLuaManager->registerFile(__DIR__ . "/../lua");
+        $redis_pool->getSync()->close();
+        $redis_pool = null;
         return parent::start();
     }
 
@@ -143,48 +153,21 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
         $clear_redis = shell_read();
         if (strtolower($clear_redis) == 'y') {
             echo "[初始化] 清除Redis上用户状态。\n";
-            $this->getRedis()->del(SwooleMarco::redis_uid_usid_hash_name);
-            $this->getRedis()->close();
-            unset($this->redis_client);
+            $redis_pool = new RedisAsynPool($this->config, $this->config->get('redis.active'));
+            $redis_pool->getSync()->del(SwooleMarco::redis_uid_usid_hash_name);
+            $redis_pool->getSync()->close();
+            unset($redis_pool);
         }
-    }
-
-    /**
-     * 获取同步redis
-     * @return \Redis
-     * @throws SwooleException
-     */
-    public function getRedis()
-    {
-        if (isset($this->redis_client)) return $this->redis_client;
-        $active = $this->config['redis']['active'];
-        //同步redis连接，给task使用
-        $this->redis_client = new \Redis();
-
-        if ($this->redis_client->connect($this->config['redis'][$active]['ip'], $this->config['redis'][$active]['port']) == false) {
-            throw new SwooleException($this->redis_client->getLastError());
-        }
-        if ($this->config->has('redis.' . $active . '.password')) {//存在验证
-            if ($this->redis_client->auth($this->config['redis'][$active]['password']) == false) {
-                throw new SwooleException($this->redis_client->getLastError());
-            }
-        }
-        $this->redis_client->select($this->config['redis'][$active]['select']);
-        return $this->redis_client;
     }
 
     /**
      * 获取同步mysql
      * @return Miner
+     * @throws SwooleException
      */
     public function getMysql()
     {
-        if (isset($this->mysql_client)) return $this->mysql_client;
-        $active = $this->config['database']['active'];
-        $activeConfig = $this->config['database'][$active];
-        $this->mysql_client = new Miner();
-        $this->mysql_client->pdoConnect($activeConfig);
-        return $this->mysql_client;
+        return $this->mysql_pool->getSync();
     }
 
     /**
@@ -206,29 +189,30 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
         $this->uid_fd_table = new \swoole_table(65536);
         $this->uid_fd_table->column('fd', \swoole_table::TYPE_INT, 8);
         $this->uid_fd_table->create();
-        //创建redis，mysql异步连接池进程
-        if ($this->config->get('asyn_process_enable', false)) {//代表启动单独进程进行管理
-            $this->pool_process = new \swoole_process(function ($process) {
-                $process->name('SWD-ASYN');
-                $this->asnyPoolManager = new AsynPoolManager($process, $this);
-                $this->asnyPoolManager->event_add();
-                $this->asnyPoolManager->registAsyn(new RedisAsynPool());
-                $this->asnyPoolManager->registAsyn(new MysqlAsynPool());
-            }, false, 2);
-            $this->server->addProcess($this->pool_process);
-        }
+        //创建task用的taskid
+        $this->task_atomic = new \swoole_atomic(0);
+        //创建task用的id->pid共享内存表不至于同时超过1024个任务吧
+        $this->tid_pid_table = new \swoole_table(1024);
+        $this->tid_pid_table->column('pid', \swoole_table::TYPE_INT, 8);
+        $this->tid_pid_table->column('des', \swoole_table::TYPE_STRING, 50);
+        $this->tid_pid_table->column('start_time', \swoole_table::TYPE_INT, 8);
+        $this->tid_pid_table->create();
+        //创建task用的锁
+        $this->task_lock = new \swoole_lock(SWOOLE_MUTEX);
         //reload监控进程
-        if ($this->config->get('auto_reload_enable', false)) {//代表启动单独进程进行reload管理
-            $reload_process = new \swoole_process(function ($process) {
-                $process->name('SWD-RELOAD');
-                new InotifyProcess($this->server);
-            }, false, 2);
-            $this->server->addProcess($reload_process);
+        ReloadHelp::startProcess();
+        //consul进程
+        ConsulHelp::startProcess();
+        //开启一个UDP用于发graylog
+        if($this->config->get('log.active')=='graylog'){
+            $udp_port =  $this->server->listen($this->config['tcp']['socket'], $this->config['log']['graylog']['udp_send_port'], SWOOLE_SOCK_UDP);
+            $udp_port->on('packet',function (){
+            });
         }
         if ($this->config->get('use_dispatch')) {
             //创建dispatch端口用于连接dispatch
             $this->dispatch_port = $this->server->listen($this->config['tcp']['socket'], $this->config['server']['dispatch_port'], SWOOLE_SOCK_TCP);
-            $this->dispatch_port->set($this->setServerSet());
+            $this->dispatch_port->set($this->probuf_set);
             $this->dispatch_port->on('close', function ($serv, $fd) {
                 print_r("Remove a dispatcher.\n");
                 for ($i = 0; $i < $this->worker_num + $this->task_num; $i++) {
@@ -236,7 +220,7 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
                     $data = $this->packSerevrMessageBody(SwooleMarco::REMOVE_DISPATCH_CLIENT, $fd);
                     $serv->sendMessage($data, $i);
                 }
-                $this->removeDispatch($fd);
+                $this->sendToAllWorks(SwooleMarco::REMOVE_DISPATCH_CLIENT, $fd, DispatchHelp::class . "::removeDispatch");
             });
 
             $this->dispatch_port->on('receive', function ($serv, $fd, $from_id, $data) {
@@ -251,12 +235,7 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
                         $uns_data['fd'] = $fd;
                         $fdinfo = $this->server->connection_info($fd);
                         $uns_data['remote_ip'] = $fdinfo['remote_ip'];
-                        $send_data = $this->packSerevrMessageBody($type, $uns_data);
-                        for ($i = 0; $i < $this->worker_num + $this->task_num; $i++) {
-                            if ($i == $serv->worker_id) continue;
-                            $serv->sendMessage($send_data, $i);
-                        }
-                        $this->addDispatch($uns_data);
+                        $this->sendToAllWorks($type, $uns_data, DispatchHelp::class . "::addDispatch");
                         break;
                     case SwooleMarco::MSG_TYPE_SEND://发送消息
                         $this->sendToUid($message['uid'], $message['data'], true);
@@ -277,6 +256,23 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
+     * 发送给所有的进程，$callStaticFuc为静态方法,会在每个进程都执行
+     * @param $type
+     * @param $uns_data
+     * @param string $callStaticFuc
+     */
+    public function sendToAllWorks($type, $uns_data, string $callStaticFuc)
+    {
+        $send_data = $this->packSerevrMessageBody($type, $uns_data, $callStaticFuc);
+        for ($i = 0; $i < $this->worker_num + $this->task_num; $i++) {
+            if ($this->server->worker_id == $i) continue;
+            $this->server->sendMessage($send_data, $i);
+        }
+        //自己的进程是收不到消息的所以这里执行下
+        call_user_func($callStaticFuc, $uns_data);
+    }
+
+    /**
      * 设置服务器配置参数
      * @return array
      */
@@ -291,6 +287,7 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
+     * 被DispatchHelp调用
      * 移除dispatch
      * @param $fd
      */
@@ -300,6 +297,7 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
+     * 被DispatchHelp调用
      * 添加一个dispatch
      * @param $data
      */
@@ -396,22 +394,14 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
                 return null;
             case SwooleMarco::SERVER_TYPE_TASK://task任务
                 $task_name = $message['task_name'];
-                $task = $this->loader->task($task_name);
+                $task = $this->loader->task($task_name, $this);
                 $task_fuc_name = $message['task_fuc_name'];
                 $task_data = $message['task_fuc_data'];
+                $task_context = $message['task_context'];
                 if (method_exists($task, $task_fuc_name)) {
-                    $result = call_user_func_array(array($task, $task_fuc_name), $task_data);
-                    if ($result instanceof \Generator) {
-                        $corotineTask = new CoroutineTask($result, new GeneratorContext());
-                        while (1) {
-                            if ($corotineTask->isFinished()) {
-                                $result = $result->getReturn();
-                                $corotineTask->destory();
-                                break;
-                            }
-                            $corotineTask->run();
-                        }
-                    }
+                    //给task做初始化操作
+                    $task->initialization($task_id, $from_id,$this->server->worker_pid, $task_name, $task_fuc_name, $task_context);
+                    $result = Coroutine::startCoroutine([$task, $task_fuc_name], $task_data);
                 } else {
                     throw new SwooleException("method $task_fuc_name not exist in $task_name");
                 }
@@ -420,6 +410,16 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
             default:
                 return parent::onSwooleTask($serv, $task_id, $from_id, $data);
         }
+    }
+
+    /**
+     * 获取同步redis
+     * @return \Redis
+     * @throws SwooleException
+     */
+    public function getRedis()
+    {
+        return $this->redis_pool->getSync();
     }
 
     /**
@@ -486,17 +486,33 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     {
         parent::onSwoolePipeMessage($serv, $from_worker_id, $message);
         $data = unserialize($message);
-        switch ($data['type']) {
-            case SwooleMarco::MSG_TYPE_USID:
-                $this->addDispatch($data['message']);
-                break;
-            case SwooleMarco::REMOVE_DISPATCH_CLIENT:
-                $this->removeDispatch($data['message']);
-                break;
-            case SwooleMarco::MSG_TYPE_REDIS_MESSAGE:
-                $this->asnyPoolManager->distribute($data['message']);
-                break;
+        if (!empty($data['func'])) {
+            call_user_func($data['func'], $data['message']);
         }
+    }
+
+    /**
+     * 添加AsynPool
+     * @param $name
+     * @param AsynPool $pool
+     * @throws SwooleException
+     */
+    public function addAsynPool($name, AsynPool $pool)
+    {
+        if (array_key_exists($name, $this->asynPools)) {
+            throw  new SwooleException('pool key is exists!');
+        }
+        $this->asynPools[$name] = $pool;
+    }
+
+    /**
+     * 获取连接池
+     * @param $name
+     * @return AsynPool
+     */
+    public function getAsynPool($name)
+    {
+        return $this->asynPools[$name];
     }
 
     /**
@@ -508,85 +524,43 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     public function onSwooleWorkerStart($serv, $workerId)
     {
         parent::onSwooleWorkerStart($serv, $workerId);
-        $this->redis_pool = new RedisAsynPool();
-        $this->mysql_pool = new MysqlAsynPool();
-        if (!$serv->taskworker) {
-            //异步redis连接池
-            $this->redis_pool->worker_init($workerId);
-            //异步mysql连接池
-            $this->mysql_pool->worker_init($workerId);
-            //注册
-            $this->asnyPoolManager = new AsynPoolManager($this->pool_process, $this);
-            if (!$this->config['asyn_process_enable']) {
-                $this->asnyPoolManager->no_event_add();
-            }
-            $this->asnyPoolManager->registAsyn($this->redis_pool);
-            $this->asnyPoolManager->registAsyn($this->mysql_pool);
-            //初始化异步Client
-            $this->client = new Client();
-        }
-        //进程锁
-        if (!$this->isTaskWorker()&&$this->initLock->trylock()) {
+        $this->initAsynPools();
+        $this->redis_pool = $this->asynPools['redisPool'];
+        $this->mysql_pool = $this->asynPools['mysqlPool'];
+        //进程锁保证只有一个进程会执行以下的代码,reload也不会执行
+        if (!$this->isTaskWorker() && $this->initLock->trylock()) {
             //进程启动后进行开服的初始化
-            $generator = $this->onOpenServiceInitialization();
-            if ($generator instanceof \Generator) {
-                $generatorContext = new GeneratorContext();
-                $generatorContext->setController(null, 'SwooleDistributedServer', 'onSwooleWorkerStart');
-                $this->coroutine->start($generator, $generatorContext);
-            }
+            Coroutine::startCoroutine([$this,'onOpenServiceInitialization']);
             if (SwooleServer::$testUnity) {
-                new TestModule(SwooleServer::$testUnityDir, $this->coroutine);
+                new TestModule(SwooleServer::$testUnityDir);
             }
             $this->initLock->lock_read();
         }
         //最后一个worker处理启动定时器
         if ($workerId == $this->worker_num - 1) {
-            //重新读入timerTask配置
-            $timerTaskConfig = $this->config->load(__DIR__ . '/../config/timerTask.php');
-            $timer_tasks = $timerTaskConfig->get('timerTask');
-            $this->timer_tasks_used = array();
-
-            foreach ($timer_tasks as $timer_task) {
-                $task_name = $timer_task['task_name']??'';
-                $model_name = $timer_task['model_name']??'';
-                if (empty($task_name) && empty($model_name)) {
-                    throw new SwooleException('定时任务配置错误，缺少task_name或者model_name.');
-                }
-                $method_name = $timer_task['method_name'];
-                if (!key_exists('start_time', $timer_task)) {
-                    $start_time = -1;
-                } else {
-                    $start_time = strtotime(date($timer_task['start_time']));
-                }
-                if (!key_exists('end_time', $timer_task)) {
-                    $end_time = -1;
-                } else {
-                    $end_time = strtotime(date($timer_task['end_time']));
-                }
-                if (!key_exists('delay', $timer_task)) {
-                    $delay = false;
-                } else {
-                    $delay = $timer_task['delay'];
-                }
-                $interval_time = $timer_task['interval_time'] < 1 ? 1 : $timer_task['interval_time'];
-                $max_exec = $timer_task['max_exec']??-1;
-                $this->timer_tasks_used[] = [
-                    'task_name' => $task_name,
-                    'model_name' => $model_name,
-                    'method_name' => $method_name,
-                    'start_time' => $start_time,
-                    'end_time' => $end_time,
-                    'interval_time' => $interval_time,
-                    'max_exec' => $max_exec,
-                    'now_exec' => 0,
-                    'delay' => $delay
-                ];
-            }
-            if (count($this->timer_tasks_used) > 0) {
-                $this->timerTask();
-                $serv->tick(1000, [$this, 'timerTask']);
+            //启动定时器任务
+            new TimerTask($this->config);
+        }
+        //第一个worker启动Consul健康检查
+        if ($workerId == 0) {
+            if (get_instance()->config->get('consul_enable', false)) {
+                Coroutine::startCoroutine(function () {
+                    yield ConsulServices::getInstance()->serviceHealthCheck();
+                });
             }
         }
+    }
+
+    /**
+     * 初始化各种连接池
+     */
+    public function initAsynPools()
+    {
+        $this->asynPools = [
+            'redisPool' => new RedisAsynPool($this->config, $this->config->get('redis.active')),
+            'mysqlPool' => new MysqlAsynPool($this->config, $this->config->get('mysql.active')),
+            'consul' => new HttpClientPool($this->config,'http://127.0.0.1:8500')
+        ];
     }
 
     /**
@@ -598,6 +572,11 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
         if ($this->config->get('autoClearGroup', false)) {
             $this->delAllGroups();
             print_r("[初始化] 清除redis上所有群信息。\n");
+        }
+        if($this->config['consul_enable']){
+            //选举leader
+            $ConsulModel = $this->loader->model('ConsulModel',$this);
+            yield $ConsulModel->leader();
         }
     }
 
@@ -641,47 +620,6 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
-     * 定时任务
-     */
-    public function timerTask()
-    {
-        $time = time();
-        foreach ($this->timer_tasks_used as &$timer_task) {
-            if ($timer_task['start_time'] < $time && $timer_task['start_time'] != -1) {
-                $count = round(($time - $timer_task['start_time']) / $timer_task['interval_time']);
-                $timer_task['start_time'] += $count * $timer_task['interval_time'];
-            }
-            if (($time == $timer_task['start_time'] || $timer_task['start_time'] == -1) &&
-                ($time < $timer_task['end_time'] || $timer_task['end_time'] = -1) &&
-                ($timer_task['now_exec'] < $timer_task['max_exec'] || $timer_task['max_exec'] == -1)
-            ) {
-                if ($timer_task['delay']) {
-                    if ($timer_task['start_time'] == -1) $timer_task['start_time'] = $time;
-                    $timer_task['start_time'] += $timer_task['interval_time'];
-                    $timer_task['delay'] = false;
-                    continue;
-                }
-                $timer_task['now_exec']++;
-                if ($timer_task['start_time'] == -1) $timer_task['start_time'] = $time;
-                $timer_task['start_time'] += $timer_task['interval_time'];
-                if (!empty($timer_task['task_name'])) {
-                    $task = $this->loader->task($timer_task['task_name']);
-                    call_user_func([$task, $timer_task['method_name']]);
-                    $task->startTask(null);
-                } else {
-                    $model = $this->loader->model($timer_task['model_name'], $this);
-                    $generator = call_user_func([$model, $timer_task['method_name']]);
-                    if ($generator instanceof \Generator) {
-                        $generatorContext = new GeneratorContext();
-                        $generatorContext->setController(null, $timer_task['model_name'], $timer_task['method_name']);
-                        $this->coroutine->start($generator, $generatorContext);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
      * 连接断开
      * @param $serv
      * @param $fd
@@ -691,15 +629,34 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
         $info = $serv->connection_info($fd, 0, true);
         $uid = $info['uid']??0;
         if (!empty($uid)) {
-            $generator = $this->onUidCloseClear($uid);
-            if ($generator instanceof \Generator) {
-                $generatorContext = new GeneratorContext();
-                $generatorContext->setController(null, 'SwooleDistributedServer', 'onSwooleClose');
-                $this->coroutine->start($generator, $generatorContext);
-            }
+            Coroutine::startCoroutine([$this, 'onUidCloseClear'], [$uid]);
             $this->unBindUid($uid);
         }
         parent::onSwooleClose($serv, $fd);
+    }
+
+    /**
+     * ｗｅｂｓｏｃｋｅｔ的连接断开
+     * @param $serv
+     * @param $fd
+     */
+    public function onSwooleWSClose($serv, $fd)
+    {
+        $this->onSwooleClose($serv,$fd);
+    }
+
+    /**
+     * 解绑uid，链接断开自动解绑
+     * @param $uid
+     */
+    public function unBindUid($uid)
+    {
+        //更新共享内存
+        $ok = $this->uid_fd_table->del($uid);
+        //更新映射表
+        if ($ok) {//说明是本机绑定的uid
+            $this->getRedis()->hDel(SwooleMarco::redis_uid_usid_hash_name, $uid);
+        }
     }
 
     /**
@@ -708,21 +665,6 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
      * @param $uid
      */
     abstract public function onUidCloseClear($uid);
-
-    /**
-     * 解绑uid，链接断开自动解绑
-     * @param $uid
-     */
-    public function unBindUid($uid)
-    {
-        //更新映射表
-        $usid = $this->getRedis()->hGet(SwooleMarco::redis_uid_usid_hash_name, $uid);
-        if ($usid == $this->USID) {
-            $this->getRedis()->hDel(SwooleMarco::redis_uid_usid_hash_name, $uid);
-        }
-        //更新共享内存
-        $this->uid_fd_table->del($uid);
-    }
 
     /**
      * 将fd绑定到uid,uid不能为0
@@ -743,72 +685,35 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
-     * uid是否在线(异步时候需要提供callback,task可以直接返回结果)
-     * @param $uid
-     * @param $callback
-     * @return int 0代表不在线1代表在线
-     */
-    public function uidIsOnline($uid, $callback)
-    {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->hExists(SwooleMarco::redis_uid_usid_hash_name, $uid);
-        } else {
-            $this->redis_pool->hExists(SwooleMarco::redis_uid_usid_hash_name, $uid, $callback);
-        }
-    }
-
-    /**
      * uid是否在线(协程)
      * @param $uid
-     * @return RedisCoroutine
+     * @return int
      * @throws SwooleException
      */
     public function coroutineUidIsOnline($uid)
     {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->hExists(SwooleMarco::redis_uid_usid_hash_name, $uid);
-        }
-        return $this->redis_pool->coroutineSend('hExists', SwooleMarco::redis_uid_usid_hash_name, $uid);
+        return yield $this->redis_pool->getCoroutine()->hExists(SwooleMarco::redis_uid_usid_hash_name, $uid);
     }
 
-    /**
-     * 获取在线人数(异步时候需要提供callback,task可以直接返回结果)
-     * @param $callback
-     * @return int
-     */
-    public function countOnline($callback)
-    {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->hLen(SwooleMarco::redis_uid_usid_hash_name);
-        } else {
-            $this->redis_pool->hLen(SwooleMarco::redis_uid_usid_hash_name, $callback);
-        }
-    }
 
     /**
      * 获取在线人数(协程)
-     * @return RedisCoroutine
+     * @return int
      * @throws SwooleException
      */
     public function coroutineCountOnline()
     {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->hLen(SwooleMarco::redis_uid_usid_hash_name);
-        }
-        return $this->redis_pool->coroutineSend('hLen', SwooleMarco::redis_uid_usid_hash_name);
+        return yield $this->redis_pool->getCoroutine()->hLen(SwooleMarco::redis_uid_usid_hash_name);
     }
 
     /**
      * 获取所有的群id（协程）
-     * @return RedisCoroutine
+     * @return array
      * @throws SwooleException
      */
     public function coroutineGetAllGroups()
     {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->sMembers(SwooleMarco::redis_groups_hash_name);
-        }
-        return $this->redis_pool->coroutineSend('sMembers', SwooleMarco::redis_groups_hash_name);
+        return yield $this->redis_pool->getCoroutine()->sMembers(SwooleMarco::redis_groups_hash_name);
     }
 
     /**
@@ -866,61 +771,25 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     }
 
     /**
-     * 获取群的人数(异步时候需要提供callback,task可以直接返回结果)
-     * @param $group_id
-     * @param $callback
-     * @return int
-     */
-    public function getGroupCount($group_id, $callback)
-    {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->scard(SwooleMarco::redis_group_hash_name_prefix . $group_id);
-        } else {
-            $this->redis_pool->scard(SwooleMarco::redis_group_hash_name_prefix . $group_id, $callback);
-        }
-    }
-
-    /**
      * 获取群的人数（协程）
      * @param $group_id
-     * @return RedisCoroutine
+     * @return int
      * @throws SwooleException
      */
     public function coroutineGetGroupCount($group_id)
     {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->sCard(SwooleMarco::redis_group_hash_name_prefix . $group_id);
-        }
-        return $this->redis_pool->coroutineSend('scard', SwooleMarco::redis_group_hash_name_prefix . $group_id);
-    }
-
-    /**
-     * 获取群成员uids(异步时候需要提供callback,task可以直接返回结果)
-     * @param $group_id
-     * @param $callback
-     * @return array
-     */
-    public function getGroupUids($group_id, $callback)
-    {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->sMembers(SwooleMarco::redis_group_hash_name_prefix . $group_id);
-        } else {
-            $this->redis_pool->sMembers(SwooleMarco::redis_group_hash_name_prefix . $group_id, $callback);
-        }
+        return yield $this->redis_pool->getCoroutine()->sCard(SwooleMarco::redis_group_hash_name_prefix . $group_id);
     }
 
     /**
      * 获取群成员uids (协程)
      * @param $group_id
-     * @return RedisCoroutine
+     * @return array
      * @throws SwooleException
      */
     public function coroutineGetGroupUids($group_id)
     {
-        if ($this->isTaskWorker()) {
-            return $this->getRedis()->sMembers(SwooleMarco::redis_group_hash_name_prefix . $group_id);
-        }
-        return $this->redis_pool->coroutineSend('sMembers', SwooleMarco::redis_group_hash_name_prefix . $group_id);
+        return yield $this->redis_pool->getCoroutine()->sMembers(SwooleMarco::redis_group_hash_name_prefix . $group_id);
     }
 
     /**
@@ -942,5 +811,35 @@ abstract class SwooleDistributedServer extends SwooleWebSocketServer
     {
         $data = $this->encode($this->pack->pack($data));
         $this->sendToDispatchMessage(SwooleMarco::MSG_TYPE_SEND_GROUP, ['data' => $data, 'groupId' => $groupId]);
+    }
+
+    /**
+     * 向task发送强制停止命令
+     * @param $task_id
+     */
+    public function stopTask($task_id)
+    {
+        $task_pid = get_instance()->tid_pid_table->get($task_id)['pid'];
+        if($task_pid!=null) {
+            posix_kill($task_pid, SIGKILL);
+            get_instance()->tid_pid_table->del($task_id);
+        }
+    }
+
+    /**
+     * 获取服务器上正在运行的Task
+     * @return array
+     */
+    public function getServerAllTaskMessage()
+    {
+        $tasks = [];
+        foreach ($this->tid_pid_table as $id => $row) {
+            if ($id != 0) {
+                $row['task_id'] = $id;
+                $row['run_time'] = time() - $row['start_time'];
+                $tasks[] = $row;
+            }
+        }
+        return $tasks;
     }
 }

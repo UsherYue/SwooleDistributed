@@ -1,7 +1,7 @@
 <?php
 /**
  * Created by PhpStorm.
- * User: tmtbe
+ * User: zhangjincheng
  * Date: 16-7-20
  * Time: 下午1:39
  */
@@ -39,16 +39,6 @@ class SwooleMarco
      * 踢uid下线
      */
     const MSG_TYPE_KICK_UID = 4;
-
-    /**
-     * REDIS 异步回调消息
-     */
-    const MSG_TYPE_REDIS_MESSAGE = 6000;
-    /**
-     * MYSQL 异步回调消息
-     */
-    const MSG_TYPE_MYSQL_MESSAGE = 6001;
-
     /**
      * 添加server
      */
@@ -64,6 +54,18 @@ class SwooleMarco
      */
     const REMOVE_DISPATCH_CLIENT = 2002;
 
+    /**
+     * consul 服务变更
+     */
+    const CONSUL_SERVICES_CHANGE = 8500;
+    /**
+     * consul Leader变更
+     */
+    const CONSUL_SERVICES_LEADER_CHANGE = 8600;
+    /**
+     * consul_session
+     */
+    const CONSUL_SERVICES_SESSION = 8700;
     /**
      * redis uid和全局usid映射表的hashkey
      * @var string

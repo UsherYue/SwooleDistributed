@@ -1,7 +1,7 @@
 <?php
 /**
  * Created by PhpStorm.
- * User: tmtbe
+ * User: zhangjincheng
  * Date: 16-7-29
  * Time: 上午11:02
  */
@@ -98,6 +98,20 @@ class HttpInput
     }
 
     /**
+     * @param $index
+     * @param bool $xss_clean
+     * @return array|bool|string
+     */
+    public function header($index, $xss_clean = true)
+    {
+        if ($xss_clean) {
+            return XssClean::getXssClean()->xss_clean($this->request->header[$index]??'');
+        } else {
+            return $this->request->header[$index]??'';
+        }
+    }
+
+    /**
      * getAllHeader
      * @return array
      */
@@ -173,7 +187,11 @@ class HttpInput
      */
     public function getRequestUri()
     {
-        return $this->request->server['request_uri'];
+        if (array_key_exists('query_string', $this->request->server)) {
+            return $this->request->server['request_uri'] . "?" . $this->request->server['query_string'];
+        } else {
+            return $this->request->server['request_uri'];
+        }
     }
 
     /**
